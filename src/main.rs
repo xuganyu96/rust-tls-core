@@ -19,14 +19,16 @@ impl<T: Write> LoggedTcpStream<T> {
 impl<T: Write> Read for LoggedTcpStream<T> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let nbytes = self.socket.read(buf)?;
-        self.writer.write(buf)?;
+        let hexstr = hex::encode(&buf);
+        writeln!(self.writer, "Received: {}", hexstr)?;
         return Ok(nbytes);
     }
 }
 
 impl<T: Write> Write for LoggedTcpStream<T> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.writer.write(&buf)?;
+        let hexstr = hex::encode(&buf);
+        writeln!(self.writer, "Sent: {}", hexstr)?;
         return self.socket.write(&buf);
     }
 
@@ -35,27 +37,6 @@ impl<T: Write> Write for LoggedTcpStream<T> {
     }
 }
 
-/// Convert bytes to hex-encoding, then write to the underlying writer
-struct HexEncoder<T> {
-    writer: T,
-}
-
-impl<T: Write> HexEncoder<T> {
-    fn new(writer: T) -> Self {
-        return Self { writer };
-    }
-}
-
-impl<T: Write> Write for HexEncoder<T> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let hexstr = hex::encode(buf);
-        self.writer.write(hexstr.as_bytes())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.writer.flush()
-    }
-}
 
 fn main() {
     let mut root_store = RootCertStore::empty();
@@ -79,7 +60,7 @@ fn main() {
     let server_name = "www.rust-lang.org".try_into().unwrap();
     let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
     let mut sock = LoggedTcpStream::new(
-        HexEncoder::new(stdout()),
+        stdout(),
         TcpStream::connect("www.rust-lang.org:443").unwrap()
     );
 
