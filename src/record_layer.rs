@@ -81,6 +81,73 @@ impl<T: Into<Vec<u8>>> From<TLSCiphertext<T>> for Vec<u8> {
     }
 }
 
+#[allow(dead_code)]
+enum RecordLayerParser<'a> {
+    ExpectContentType{
+        remainder: &'a [u8],
+    },
+    ExpectProtocolVersion{
+        content_type: ContentType,
+        remainder: &'a [u8],
+    },
+    ExpectLength,
+    ExpectContent,
+    Failed,
+    Finished,
+}
+
+#[allow(dead_code)]
+impl<'a> RecordLayerParser<'a> {
+    /// The finite state machine always start with "ExpectContentType"
+    fn start(remainder: &'a [u8]) -> Self {
+        return Self::ExpectContentType { remainder };
+    }
+
+    fn is_failed(&self) -> bool {
+        match self {
+            Self::Failed => true,
+            _ => false,
+        }
+    }
+
+    /// Attempt to extract the content_type encoding from the remainder of the
+    /// received bytes. If there is a valid content_type encoding, return
+    /// Self::ExpectProtocolVersion, otherwise return Self::Failed
+    fn parse_content_type(self) -> Self {
+        let remainder = match self {
+            Self::ExpectContentType{remainder} => remainder,
+            _ => unreachable!(),
+        };
+        if remainder.len() < 1 {
+            // TODO: Failed because content_type encoding is missing
+            return Self::Failed;
+        }
+        // Unwrap is ok because there is guaranteed to be at least one byte
+        let encoding = remainder.get(0).unwrap();
+        return match ContentType::try_from(encoding.clone()) {
+            Ok(content_type) => {
+                Self::ExpectProtocolVersion{
+                    content_type,
+                    remainder: &remainder[1..],
+                }
+            },
+            Err(_) => {
+                // TODO: failed because is encoding is invalid
+                Self::Failed
+            }
+        }
+    }
+
+    /// Attempt to extract the protocol version encoding from the remainder of
+    /// the received bytes. If there is a valid protocol_version encoding,
+    /// return Self::ExpectLength, else return Self.Failed
+    fn parse_protocol_version(self) -> Self {
+        todo!();
+    }
+}
+
+
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -98,5 +165,31 @@ mod test {
         let record: Vec<u8> = record.into();
 
         assert_eq!(record, vec![23, 0x03, 0x01, 0x00, 0x05, 0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_parse_content_type() {
+        let start = RecordLayerParser::start(&[0x16, 1, 2, 3, 4]);
+        match start.parse_content_type() {
+            RecordLayerParser::ExpectProtocolVersion {
+                content_type, remainder
+            } => {
+                assert_eq!(content_type, ContentType::Handshake);
+                assert_eq!(remainder, &[1, 2, 3, 4]);
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn missing_content_type() {
+        let start = RecordLayerParser::start(&[]);
+        assert!(start.parse_content_type().is_failed());
+    }
+
+    #[test]
+    fn invalid_content_type_encoding() {
+        let start = RecordLayerParser::start(&[0xff, 2, 3, 4]);
+        assert!(start.parse_content_type().is_failed());
     }
 }

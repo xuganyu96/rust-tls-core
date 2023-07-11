@@ -2,7 +2,7 @@ use std::error::Error;
 
 /// Each type is exactly one byte wide
 #[allow(dead_code)]
-#[derive(Debug,Clone)]
+#[derive(Debug,Clone,Eq,PartialEq)]
 pub(crate) enum ContentType {
     Invalid,
     ChangeCipherSpec,
@@ -22,6 +22,21 @@ impl TryFrom<ContentType> for u8 {
             ContentType::Handshake => Ok(0x16),
             ContentType::ApplicationData => Ok(0x17),
         }
+    }
+}
+
+impl TryFrom<u8> for ContentType {
+    type Error = Box<dyn Error>;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        return match value {
+            0x00 => Ok(Self::Invalid),
+            0x14 => Ok(Self::ChangeCipherSpec),
+            0x15 => Ok(Self::Alert),
+            0x16 => Ok(Self::Handshake),
+            0x17 => Ok(Self::ApplicationData),
+            _ => Err("Invalid encoding".into()),
+        };
     }
 }
 
