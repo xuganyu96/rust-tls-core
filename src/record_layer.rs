@@ -2,6 +2,8 @@
 //! being sent into the TCP stream
 use crate::constants::{ContentType, ProtocolVersion};
 
+const TLS_PLAINTEXT_MAX_LENGTH: u16 = 0b0100000000000000;
+
 /// Record is the top layer abstraction that is serialized into the TCP stream
 #[allow(dead_code)]
 enum Record<T> {
@@ -95,9 +97,16 @@ enum RecordLayerParser<'a> {
         protocol_version: ProtocolVersion,
         remainder: &'a [u8],
     },
-    ExpectContent,
+    ExpectContent {
+        content_type: ContentType,
+        protocol_version: ProtocolVersion,
+        length: u16,
+        remainder: &'a [u8],
+    },
+    Finished {
+        tls_plaintext: TLSPlaintext<Vec<u8>>,
+    },
     Failed,
-    Finished,
 }
 
 #[allow(dead_code)]
@@ -160,6 +169,68 @@ impl<'a> RecordLayerParser<'a> {
             },
             Err(_) => Self::Failed,
         };
+    }
+
+    /// Attempt to extract the length encoding (big endian, aka network endian,
+    /// aka lower memory address encodes more significant digit) from the
+    /// remaining bytes. If there is a valid length, return
+    /// Self::ExpectContent, else return Self::Failed
+    fn parse_length(self) -> Self {
+        let (content_type, protocol_version, remainder) = match self {
+            Self::ExpectLength {
+                content_type,
+                protocol_version,
+                remainder,
+            } => (content_type, protocol_version, remainder),
+            _ => unreachable!(),
+        };
+
+        if remainder.len() < 2 {
+            // TODO: Failed due to insufficient bytes
+            return Self::Failed;
+        }
+
+        let mut length_encoding: [u8; 2] = [0; 2];
+        // Unwrapping is okay because length is guaranteed
+        length_encoding.copy_from_slice(remainder.get(0..2).unwrap());
+        let length = u16::from_be_bytes(length_encoding);
+        if length > TLS_PLAINTEXT_MAX_LENGTH {
+            // TODO: Failed due to length overflow
+            return Self::Failed;
+        }
+
+        return Self::ExpectContent {
+            content_type,
+            protocol_version,
+            length,
+            remainder: remainder.get(2..).unwrap(),
+        };
+    }
+
+    /// Attempt to parse the content according to the previously parsed length
+    fn parse_content(self) -> Self {
+        let (content_type, legacy_record_version, length, remainder) = match self {
+            Self::ExpectContent {
+                content_type,
+                protocol_version,
+                length,
+                remainder,
+            } => (content_type, protocol_version, length, remainder),
+            _ => unreachable!(),
+        };
+
+        if remainder.len() != usize::from(length) {
+            return Self::Failed;
+        }
+        let fragment: Vec<u8> = remainder.into();
+        let tls_plaintext = TLSPlaintext {
+            content_type,
+            legacy_record_version,
+            length,
+            fragment,
+        };
+
+        return Self::Finished { tls_plaintext };
     }
 }
 
@@ -248,5 +319,78 @@ mod test {
         };
 
         assert!(start.parse_protocol_version().is_failed());
+    }
+
+    #[test]
+    fn parse_length() {
+        let start = RecordLayerParser::ExpectLength {
+            content_type: ContentType::Handshake,
+            protocol_version: ProtocolVersion::TLSv1_2,
+            remainder: &[0x01, 0x00, 1, 2, 3], // 0x0100 encodes 256
+        };
+
+        match start.parse_length() {
+            RecordLayerParser::ExpectContent {
+                content_type: _,
+                protocol_version: _,
+                length,
+                remainder,
+            } => {
+                assert_eq!(length, 256u16);
+                assert_eq!(remainder, &[1, 2, 3]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn invalid_length_encoding() {
+        let start = RecordLayerParser::ExpectLength {
+            content_type: ContentType::Handshake,
+            protocol_version: ProtocolVersion::TLSv1_2,
+            remainder: &[0x01], // too few bytes
+        };
+
+        assert!(start.parse_length().is_failed());
+    }
+
+    #[test]
+    fn plaintext_overflow() {
+        let start = RecordLayerParser::ExpectLength {
+            content_type: ContentType::Handshake,
+            protocol_version: ProtocolVersion::TLSv1_2,
+            remainder: &[0x40, 0x01, 1, 2, 3], // 0x4000 is 2 ^ 14
+        };
+
+        assert!(start.parse_length().is_failed());
+    }
+
+    #[test]
+    fn parse_content() {
+        let start = RecordLayerParser::ExpectContent {
+            content_type: ContentType::Handshake,
+            protocol_version: ProtocolVersion::TLSv1_2,
+            length: 5u16,
+            remainder: &[6, 9, 4, 2, 0],
+        };
+
+        match start.parse_content() {
+            RecordLayerParser::Finished { tls_plaintext } => {
+                assert_eq!(tls_plaintext.fragment, vec![6, 9, 4, 2, 0]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn parse_content_wrong_length() {
+        let start = RecordLayerParser::ExpectContent {
+            content_type: ContentType::Handshake,
+            protocol_version: ProtocolVersion::TLSv1_2,
+            length: 10u16,
+            remainder: &[6, 9, 4, 2, 0],
+        };
+
+        assert!(start.parse_content().is_failed());
     }
 }
