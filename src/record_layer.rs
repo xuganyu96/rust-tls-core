@@ -83,14 +83,18 @@ impl<T: Into<Vec<u8>>> From<TLSCiphertext<T>> for Vec<u8> {
 
 #[allow(dead_code)]
 enum RecordLayerParser<'a> {
-    ExpectContentType{
+    ExpectContentType {
         remainder: &'a [u8],
     },
-    ExpectProtocolVersion{
+    ExpectProtocolVersion {
         content_type: ContentType,
         remainder: &'a [u8],
     },
-    ExpectLength,
+    ExpectLength {
+        content_type: ContentType,
+        protocol_version: ProtocolVersion,
+        remainder: &'a [u8],
+    },
     ExpectContent,
     Failed,
     Finished,
@@ -115,7 +119,7 @@ impl<'a> RecordLayerParser<'a> {
     /// Self::ExpectProtocolVersion, otherwise return Self::Failed
     fn parse_content_type(self) -> Self {
         let remainder = match self {
-            Self::ExpectContentType{remainder} => remainder,
+            Self::ExpectContentType { remainder } => remainder,
             _ => unreachable!(),
         };
         if remainder.len() < 1 {
@@ -125,28 +129,39 @@ impl<'a> RecordLayerParser<'a> {
         // Unwrap is ok because there is guaranteed to be at least one byte
         let encoding = remainder.get(0).unwrap();
         return match ContentType::try_from(encoding.clone()) {
-            Ok(content_type) => {
-                Self::ExpectProtocolVersion{
-                    content_type,
-                    remainder: &remainder[1..],
-                }
+            Ok(content_type) => Self::ExpectProtocolVersion {
+                content_type,
+                remainder: &remainder[1..],
             },
             Err(_) => {
                 // TODO: failed because is encoding is invalid
                 Self::Failed
             }
-        }
+        };
     }
 
     /// Attempt to extract the protocol version encoding from the remainder of
     /// the received bytes. If there is a valid protocol_version encoding,
     /// return Self::ExpectLength, else return Self.Failed
     fn parse_protocol_version(self) -> Self {
-        todo!();
+        let (content_type, remainder) = match self {
+            Self::ExpectProtocolVersion {
+                content_type,
+                remainder,
+            } => (content_type, remainder),
+            _ => unreachable!(),
+        };
+
+        return match ProtocolVersion::try_from(remainder) {
+            Ok(protocol_version) => Self::ExpectLength {
+                content_type,
+                protocol_version,
+                remainder: remainder.get(2..).unwrap(),
+            },
+            Err(_) => Self::Failed,
+        };
     }
 }
-
-
 
 #[cfg(test)]
 mod test {
@@ -172,11 +187,12 @@ mod test {
         let start = RecordLayerParser::start(&[0x16, 1, 2, 3, 4]);
         match start.parse_content_type() {
             RecordLayerParser::ExpectProtocolVersion {
-                content_type, remainder
+                content_type,
+                remainder,
             } => {
                 assert_eq!(content_type, ContentType::Handshake);
                 assert_eq!(remainder, &[1, 2, 3, 4]);
-            },
+            }
             _ => unreachable!(),
         }
     }
@@ -191,5 +207,46 @@ mod test {
     fn invalid_content_type_encoding() {
         let start = RecordLayerParser::start(&[0xff, 2, 3, 4]);
         assert!(start.parse_content_type().is_failed());
+    }
+
+    #[test]
+    fn parse_protocol_version() {
+        let start = RecordLayerParser::ExpectProtocolVersion {
+            content_type: ContentType::Handshake,
+            remainder: &[0x03, 0x03, 1, 2, 3],
+        };
+
+        match start.parse_protocol_version() {
+            RecordLayerParser::ExpectLength {
+                content_type,
+                protocol_version,
+                remainder,
+            } => {
+                assert_eq!(content_type, ContentType::Handshake);
+                assert_eq!(protocol_version, ProtocolVersion::TLSv1_2);
+                assert_eq!(remainder, &[1, 2, 3]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn missing_protocol_version() {
+        let start = RecordLayerParser::ExpectProtocolVersion {
+            content_type: ContentType::Handshake,
+            remainder: &[0x03],
+        };
+
+        assert!(start.parse_protocol_version().is_failed());
+    }
+
+    #[test]
+    fn invalid_protocol_version_encoding() {
+        let start = RecordLayerParser::ExpectProtocolVersion {
+            content_type: ContentType::Handshake,
+            remainder: &[0x03, 0x05, 1, 2, 3], // TLS v1.4?
+        };
+
+        assert!(start.parse_protocol_version().is_failed());
     }
 }
