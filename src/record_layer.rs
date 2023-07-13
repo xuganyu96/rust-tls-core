@@ -1,6 +1,7 @@
 //! TLS Records are the top layer abstraction that are serialized first before
 //! being sent into the TCP stream
 use crate::constants::{ContentType, ProtocolVersion};
+use crate::fsm::FiniteStateMachine;
 
 const TLS_PLAINTEXT_MAX_LENGTH: u16 = 0b0100000000000000;
 
@@ -84,7 +85,7 @@ impl<T: Into<Vec<u8>>> From<TLSCiphertext<T>> for Vec<u8> {
 }
 
 #[allow(dead_code)]
-enum RecordLayerParser<'a> {
+enum TLSPlaintextParser<'a> {
     ExpectContentType {
         remainder: &'a [u8],
     },
@@ -110,7 +111,7 @@ enum RecordLayerParser<'a> {
 }
 
 #[allow(dead_code)]
-impl<'a> RecordLayerParser<'a> {
+impl<'a> TLSPlaintextParser<'a> {
     /// The finite state machine always start with "ExpectContentType"
     fn start(remainder: &'a [u8]) -> Self {
         return Self::ExpectContentType { remainder };
@@ -119,6 +120,13 @@ impl<'a> RecordLayerParser<'a> {
     fn is_failed(&self) -> bool {
         match self {
             Self::Failed => true,
+            _ => false,
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Finished { tls_plaintext: _ } => true,
             _ => false,
         }
     }
@@ -234,6 +242,25 @@ impl<'a> RecordLayerParser<'a> {
     }
 }
 
+impl<'a> FiniteStateMachine for TLSPlaintextParser<'a> {
+    type State = Self;
+
+    fn transition(self: Self) -> Self {
+        match self {
+            Self::ExpectContentType { .. } => self.parse_content_type(),
+            Self::ExpectProtocolVersion { .. } => self.parse_protocol_version(),
+            Self::ExpectLength { .. } => self.parse_length(),
+            Self::ExpectContent { .. } => self.parse_content(),
+            Self::Failed => self,
+            Self::Finished { .. } => self,
+        }
+    }
+
+    fn is_halt(self: &Self) -> bool {
+        return self.is_failed() || self.is_finished();
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -255,9 +282,9 @@ mod test {
 
     #[test]
     fn test_parse_content_type() {
-        let start = RecordLayerParser::start(&[0x16, 1, 2, 3, 4]);
+        let start = TLSPlaintextParser::start(&[0x16, 1, 2, 3, 4]);
         match start.parse_content_type() {
-            RecordLayerParser::ExpectProtocolVersion {
+            TLSPlaintextParser::ExpectProtocolVersion {
                 content_type,
                 remainder,
             } => {
@@ -270,25 +297,25 @@ mod test {
 
     #[test]
     fn missing_content_type() {
-        let start = RecordLayerParser::start(&[]);
+        let start = TLSPlaintextParser::start(&[]);
         assert!(start.parse_content_type().is_failed());
     }
 
     #[test]
     fn invalid_content_type_encoding() {
-        let start = RecordLayerParser::start(&[0xff, 2, 3, 4]);
+        let start = TLSPlaintextParser::start(&[0xff, 2, 3, 4]);
         assert!(start.parse_content_type().is_failed());
     }
 
     #[test]
     fn parse_protocol_version() {
-        let start = RecordLayerParser::ExpectProtocolVersion {
+        let start = TLSPlaintextParser::ExpectProtocolVersion {
             content_type: ContentType::Handshake,
             remainder: &[0x03, 0x03, 1, 2, 3],
         };
 
         match start.parse_protocol_version() {
-            RecordLayerParser::ExpectLength {
+            TLSPlaintextParser::ExpectLength {
                 content_type,
                 protocol_version,
                 remainder,
@@ -303,7 +330,7 @@ mod test {
 
     #[test]
     fn missing_protocol_version() {
-        let start = RecordLayerParser::ExpectProtocolVersion {
+        let start = TLSPlaintextParser::ExpectProtocolVersion {
             content_type: ContentType::Handshake,
             remainder: &[0x03],
         };
@@ -313,7 +340,7 @@ mod test {
 
     #[test]
     fn invalid_protocol_version_encoding() {
-        let start = RecordLayerParser::ExpectProtocolVersion {
+        let start = TLSPlaintextParser::ExpectProtocolVersion {
             content_type: ContentType::Handshake,
             remainder: &[0x03, 0x05, 1, 2, 3], // TLS v1.4?
         };
@@ -323,14 +350,14 @@ mod test {
 
     #[test]
     fn parse_length() {
-        let start = RecordLayerParser::ExpectLength {
+        let start = TLSPlaintextParser::ExpectLength {
             content_type: ContentType::Handshake,
             protocol_version: ProtocolVersion::TLSv1_2,
             remainder: &[0x01, 0x00, 1, 2, 3], // 0x0100 encodes 256
         };
 
         match start.parse_length() {
-            RecordLayerParser::ExpectContent {
+            TLSPlaintextParser::ExpectContent {
                 content_type: _,
                 protocol_version: _,
                 length,
@@ -345,7 +372,7 @@ mod test {
 
     #[test]
     fn invalid_length_encoding() {
-        let start = RecordLayerParser::ExpectLength {
+        let start = TLSPlaintextParser::ExpectLength {
             content_type: ContentType::Handshake,
             protocol_version: ProtocolVersion::TLSv1_2,
             remainder: &[0x01], // too few bytes
@@ -356,7 +383,7 @@ mod test {
 
     #[test]
     fn plaintext_overflow() {
-        let start = RecordLayerParser::ExpectLength {
+        let start = TLSPlaintextParser::ExpectLength {
             content_type: ContentType::Handshake,
             protocol_version: ProtocolVersion::TLSv1_2,
             remainder: &[0x40, 0x01, 1, 2, 3], // 0x4000 is 2 ^ 14
@@ -367,7 +394,7 @@ mod test {
 
     #[test]
     fn parse_content() {
-        let start = RecordLayerParser::ExpectContent {
+        let start = TLSPlaintextParser::ExpectContent {
             content_type: ContentType::Handshake,
             protocol_version: ProtocolVersion::TLSv1_2,
             length: 5u16,
@@ -375,7 +402,7 @@ mod test {
         };
 
         match start.parse_content() {
-            RecordLayerParser::Finished { tls_plaintext } => {
+            TLSPlaintextParser::Finished { tls_plaintext } => {
                 assert_eq!(tls_plaintext.fragment, vec![6, 9, 4, 2, 0]);
             }
             _ => unreachable!(),
@@ -384,7 +411,7 @@ mod test {
 
     #[test]
     fn parse_content_wrong_length() {
-        let start = RecordLayerParser::ExpectContent {
+        let start = TLSPlaintextParser::ExpectContent {
             content_type: ContentType::Handshake,
             protocol_version: ProtocolVersion::TLSv1_2,
             length: 10u16,
@@ -392,5 +419,33 @@ mod test {
         };
 
         assert!(start.parse_content().is_failed());
+    }
+
+    #[test]
+    fn complete_parsing() {
+        let mut start = TLSPlaintextParser::start(&[
+            0x16, // content_type
+            0x03, 0x03, // protocol_version
+            0x00, 0x05, // length
+            0, 1, 2, 3, 4, // content
+        ]);
+
+        while !start.is_halt() {
+            start = start.transition();
+        }
+
+        assert!(start.is_finished());
+        match start {
+            TLSPlaintextParser::Finished { tls_plaintext } => {
+                assert_eq!(tls_plaintext.content_type, ContentType::Handshake);
+                assert_eq!(
+                    tls_plaintext.legacy_record_version,
+                    ProtocolVersion::TLSv1_2
+                );
+                assert_eq!(tls_plaintext.length, 5u16);
+                assert_eq!(tls_plaintext.fragment, vec![0, 1, 2, 3, 4]);
+            }
+            _ => unreachable!(),
+        }
     }
 }
